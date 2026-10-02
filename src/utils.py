@@ -523,6 +523,37 @@ def make_entity_model(sd1, sd2):
         plant_sd = sd1
         zombie_sd = sd2
 
+    print(
+        "[PVP ENTITY zombie]",
+        "PlayerId=", zombie_sd.get("PlayerId"),
+        "Faction=", zombie_sd.get("Faction"),
+        "HeroId=", repr(zombie_sd.get("HeroId")),
+        "HeroAssetId=", repr(zombie_sd.get("HeroAssetId")),
+        "HeroAssetIdType=", type(zombie_sd.get("HeroAssetId")).__name__,
+        "super=", (zombie_sd.get("Deck") or {}).get("super"),
+        flush=True
+    )
+    print(
+        "[PVP ENTITY plant]",
+        "PlayerId=", plant_sd.get("PlayerId"),
+        "Faction=", plant_sd.get("Faction"),
+        "HeroId=", repr(plant_sd.get("HeroId")),
+        "HeroAssetId=", repr(plant_sd.get("HeroAssetId")),
+        "HeroAssetIdType=", type(plant_sd.get("HeroAssetId")).__name__,
+        "super=", (plant_sd.get("Deck") or {}).get("super"),
+        flush=True
+    )
+
+    for side, selection_data in (("zombie", zombie_sd), ("plant", plant_sd)):
+        hero_asset_id = selection_data.get("HeroAssetId")
+        if not isinstance(hero_asset_id, str) or not hero_asset_id:
+            raise ValueError(
+                "PVP entity model cannot encode component 24 field 2: "
+                f"{side} HeroAssetId must be a non-empty string, got {hero_asset_id!r}; "
+                f"PlayerId={selection_data.get('PlayerId')!r}, "
+                f"HeroId={selection_data.get('HeroId')!r}"
+            )
+
     zombie_id = zombie_sd["PlayerId"]
     zombie_hero = {
         "1": zombie_sd['HeroId'],

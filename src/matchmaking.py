@@ -13,6 +13,19 @@ def create_challenge():
     player_data = json.loads(data['sd'])
     challenger = player_data['PlayerId']
     challenged = data['o']
+
+    deck = player_data.get('Deck') or {}
+    print(
+        '[PVP SD createChallenge]',
+        'PlayerId=', player_data.get('PlayerId'),
+        'Faction=', player_data.get('Faction'),
+        'HeroId=', repr(player_data.get('HeroId')),
+        'HeroAssetId=', repr(player_data.get('HeroAssetId')),
+        'HeroAssetIdType=', type(player_data.get('HeroAssetId')).__name__,
+        'main=', deck.get('main'),
+        'super=', deck.get('super'),
+        flush=True
+    )
     seed_contribution = getrandbits(60)
     r.setex(challenger + "-sd", 20, data['sd'])
     r.setex(challenger + "-seed", 20, seed_contribution)

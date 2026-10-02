@@ -17,9 +17,30 @@ def init_game():
     seed = int.from_bytes(seed1) ^ int.from_bytes(seed2)
     sd1 = it_should_be_there_soon(pid + '-sd')
     sd2 = it_should_be_there_soon(gi + '-sd')
+    sd1_json = json.loads(sd1)
+    sd2_json = json.loads(sd2)
+
+    print(
+        '[PVP initGame sd1]',
+        'PlayerId=', sd1_json.get('PlayerId'),
+        'Faction=', sd1_json.get('Faction'),
+        'HeroId=', repr(sd1_json.get('HeroId')),
+        'HeroAssetId=', repr(sd1_json.get('HeroAssetId')),
+        'super=', (sd1_json.get('Deck') or {}).get('super'),
+        flush=True
+    )
+    print(
+        '[PVP initGame sd2]',
+        'PlayerId=', sd2_json.get('PlayerId'),
+        'Faction=', sd2_json.get('Faction'),
+        'HeroId=', repr(sd2_json.get('HeroId')),
+        'HeroAssetId=', repr(sd2_json.get('HeroAssetId')),
+        'super=', (sd2_json.get('Deck') or {}).get('super'),
+        flush=True
+    )
 
     return {
-        "entityModel": make_entity_model(json.loads(sd1), json.loads(sd2)),
+        "entityModel": make_entity_model(sd1_json, sd2_json),
         "rngSeedData": make_rng(seed),
         "ec": "CgQgACgA",
         "sc": "",
