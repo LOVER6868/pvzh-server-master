@@ -622,7 +622,10 @@ def inventory():
             "686": 4,
             "687": 4,
             "688": 4,
-            "691": 4
+            "691": 4,
+            "692": 4,
+            "693": 4,
+            "694": 4
         },
         "UnopenedBoosterPacks": [],
         "UnredeemedAdRewardCredit": 3,
