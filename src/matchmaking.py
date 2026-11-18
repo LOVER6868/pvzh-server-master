@@ -1,7 +1,7 @@
-"""Casual matchmaking, keyed by the ACTUAL card_data content fingerprint.
+"""Content-matched Casual PvP queue with complete match lifecycle cleanup.
 
-Existing challenge routes are preserved for mod-compatible clients. The
-content gate runs before any queue operation and no device approval is used.
+Uses the existing stock PvZH matchmaking response types. All Redis modifications
+that create or destroy a pair run under the same short-lived queue lock.
 """
 import json
 import secrets
@@ -12,10 +12,17 @@ from utils import get_id, it_should_be_there_soon, r
 from content_gate import verify_content_header
 
 matchmaking = Blueprint('matchmaking', __name__, url_prefix='/matchmaking/v1')
-WAIT_TTL = 180
-MATCH_TTL = 900
+
+# A waiting player must continue polling to keep a queue slot. A matched player
+# must finish the join/init handshake within JOIN_TTL. Once playing, pvp.py
+# refreshes only the *calling player's* GAME_IDLE_TTL (never the opponent's).
+WAIT_TTL = 90
+JOIN_TTL = 120
+GAME_IDLE_TTL = 180
+MATCH_TTL = 900  # selection data / RNG seed storage (not player liveness)
 WAIT_ETA = 5
 MAX_QUEUE = 200
+LOCK_NAME = 'contentmatch:queue-lock'
 
 
 def txt(v):
@@ -79,23 +86,68 @@ def require_persona(pid):
 
 
 def is_casual(body):
-    # Client wire constant PvpDataKey.Mode is 'q'.  The other aliases are
-    # tolerated only until an actual network capture confirms the exact value.
     raw = next((body[k] for k in ('q', 'mode', 'Mode', 'pvpMode', 'PvpMode')
                 if k in body), None)
     return raw is None or str(raw).lower() in ('1', 'casual')
 
 
-def cleanup_waiting(pid, st):
-    if st.get('status') == 'waiting':
-        r.zrem(queue_key(st['content'], st['faction']), pid)
-    r.delete(player_key(pid), pid + '-sd', pid + '-seed')
+def recently_seen(st, seconds):
+    try:
+        return time.time() - float(st['last_seen']) < seconds
+    except (KeyError, ValueError, TypeError):
+        return False  # old v2 states had no liveness tracking; discard them
+
+
+def _remove_player(pid, st):
+    """Delete one player's queue, selection, seed and old PvP messages."""
+    content = st.get('content')
+    if content:
+        # Remove from BOTH factions: also repairs leftover zset entries from v2.
+        for faction in ('Plants', 'Zombies'):
+            r.zrem(queue_key(content, faction), pid)
+    r.delete(player_key(pid), pid + '-sd', pid + '-seed', pid + '-update')
+
+
+def cleanup_session(pid):
+    """Delete both sides of a reciprocal match, or one unpaired queue ticket.
+
+    CALL ONLY WHILE HOLDING LOCK_NAME. Matching session IDs prevent an old
+    player's cleanup from deleting an opponent's NEW unrelated session.
+    """
+    st = state(pid)
+    if not st:
+        return False
+    other = st.get('opponent', '')
+    session = st.get('session', '')
+    peer = state(other) if other and other != pid else {}
+    reciprocal = bool(session and peer and peer.get('session') == session and
+                      peer.get('opponent') == pid and
+                      peer.get('content') == st.get('content'))
+    _remove_player(pid, st)
+    if reciprocal:
+        _remove_player(other, peer)
+    return True
+
+
+def prune_queue(content, faction):
+    """Remove members that stopped polling, including old v2 ghost entries."""
+    r.zremrangebyscore(queue_key(content, faction), '-inf', time.time() - WAIT_TTL)
+
+
+def keep_waiting(pid, st):
+    now = time.time()
+    key = player_key(pid)
+    r.hset(key, mapping={'last_seen': str(now)})
+    r.expire(key, WAIT_TTL)
+    # Queue score represents last heartbeat, not original insertion time.
+    q = queue_key(st['content'], st['faction'])
+    prune_queue(st['content'], st['faction'])
+    r.zadd(q, {pid: now})
+    r.expire(q, WAIT_TTL + 5)
 
 
 @matchmaking.before_request
 def content_guard():
-    # Compatible content is mandatory for Casual AND the challenge join path,
-    # but queryStats cannot add players to Redis and is left lightweight.
     if request.endpoint == 'matchmaking.query_stats':
         return None
     return verify_content_header()
@@ -109,66 +161,116 @@ def make_match():
     try:
         pid, faction, sd = selection(body)
         require_persona(pid)
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
-        return fail(str(e))
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return fail(str(exc))
+
     content = g.pvzh_content_digest
-    key = player_key(pid)
-    with r.lock('contentmatch:queue-lock', timeout=5, blocking_timeout=2):
+    with r.lock(LOCK_NAME, timeout=5, blocking_timeout=2):
         current = state(pid)
         if current and current.get('content') != content:
-            return fail('CardDataMismatch', 409)
+            cleanup_session(pid)  # old build must never be reused
+            current = {}
+
+        if current.get('status') == 'waiting' and current.get('faction') == faction:
+            if recently_seen(current, WAIT_TTL):
+                keep_waiting(pid, current)
+                return waiting()
+            cleanup_session(pid)
+            current = {}
+
         if current.get('status') == 'matched':
-            return paired(current['opponent'])
-        if current.get('status') == 'waiting':
-            r.expire(key, WAIT_TTL)
-            return waiting()
-        r.delete(key)
+            other = current.get('opponent', '')
+            peer = state(other)
+            if (recently_seen(current, JOIN_TTL) and
+                    peer.get('session') == current.get('session') and
+                    current.get('session') and peer.get('opponent') == pid):
+                return paired(other)  # legitimate retry during the join handshake
+            cleanup_session(pid)
+            current = {}
+
+        if current:
+            # 'playing' means the user has left the previous battle and pressed
+            # Casual again. Never return their old JoinMatch response.
+            cleanup_session(pid)
+
+        r.delete(player_key(pid), pid + '-update')
         r.setex(pid + '-sd', MATCH_TTL, sd)
         r.setex(pid + '-seed', MATCH_TTL, str(secrets.randbits(60)))
-        r.hset(key, mapping={'content': content, 'faction': faction,
-                            'status': 'waiting', 'opponent': '', 'time': str(time.time())})
-        r.expire(key, WAIT_TTL)
+
         opposite = 'Zombies' if faction == 'Plants' else 'Plants'
+        prune_queue(content, opposite)
         q_opp = queue_key(content, opposite)
+        opponent_id = None
         while True:
             entries = r.zpopmin(q_opp, 1)
             if not entries:
                 break
-            opponent_id = txt(entries[0][0])
-            opponent = state(opponent_id)
-            if (opponent_id == pid or opponent.get('content') != content or
-                    opponent.get('status') != 'waiting' or
-                    opponent.get('faction') != opposite or
-                    r.exists(opponent_id + '-sd', opponent_id + '-seed') != 2):
+            candidate = txt(entries[0][0])
+            old = state(candidate)
+            if (candidate == pid or old.get('content') != content or
+                    old.get('status') != 'waiting' or old.get('faction') != opposite or
+                    not recently_seen(old, WAIT_TTL) or
+                    r.exists(candidate + '-sd', candidate + '-seed') != 2):
                 continue
-            r.hset(player_key(pid), mapping={'status': 'matched', 'opponent': opponent_id})
-            r.hset(player_key(opponent_id), mapping={'status': 'matched', 'opponent': pid})
-            for p in (pid, opponent_id):
-                r.expire(player_key(p), MATCH_TTL)
+            opponent_id = candidate
+            break
+
+        now = str(time.time())
+        if opponent_id:
+            session = secrets.token_hex(16)
+            for p, fac, other in ((pid, faction, opponent_id),
+                                  (opponent_id, opposite, pid)):
+                r.hset(player_key(p), mapping={
+                    'content': content, 'faction': fac, 'status': 'matched',
+                    'opponent': other, 'session': session,
+                    'last_seen': now,
+                })
+                r.expire(player_key(p), JOIN_TTL)
                 r.expire(p + '-sd', MATCH_TTL)
                 r.expire(p + '-seed', MATCH_TTL)
+                r.delete(p + '-update')  # never replay a previous battle
             return paired(opponent_id)
+
         q_me = queue_key(content, faction)
+        prune_queue(content, faction)
         if r.zcard(q_me) >= MAX_QUEUE:
-            cleanup_waiting(pid, state(pid))
+            r.delete(pid + '-sd', pid + '-seed')
             return fail('MatchmakingQueueFull', 429)
-        r.zadd(q_me, {pid: time.time()})
-        r.expire(q_me, MATCH_TTL)
+        r.hset(player_key(pid), mapping={
+            'content': content, 'faction': faction, 'status': 'waiting',
+            'opponent': '', 'session': '', 'last_seen': now,
+        })
+        r.expire(player_key(pid), WAIT_TTL)
+        r.zadd(q_me, {pid: float(now)})
+        r.expire(q_me, WAIT_TTL + 5)
     return waiting()
 
 
 @matchmaking.route('/matchPoll', methods=['POST'])
 def match_poll():
     pid = get_id()
-    st = state(pid)
-    if not st or st.get('content') != g.pvzh_content_digest:
-        return fail('Not queued or CardDataMismatch', 403)
-    if st.get('status') == 'matched':
-        return paired(st['opponent'])
-    if st.get('status') == 'waiting':
-        r.expire(player_key(pid), WAIT_TTL)
-        return waiting()
-    return fail('MatchmakingExpired', 404)
+    with r.lock(LOCK_NAME, timeout=5, blocking_timeout=2):
+        st = state(pid)
+        if not st or st.get('content') != g.pvzh_content_digest:
+            return fail('Not queued or CardDataMismatch', 403)
+        if st.get('status') == 'waiting':
+            if not recently_seen(st, WAIT_TTL):
+                cleanup_session(pid)
+                return fail('MatchmakingExpired', 410)
+            keep_waiting(pid, st)
+            return waiting()
+        if st.get('status') == 'matched':
+            peer = state(st.get('opponent'))
+            if (not recently_seen(st, JOIN_TTL) or
+                    not st.get('session') or peer.get('session') != st.get('session') or
+                    peer.get('opponent') != pid):
+                cleanup_session(pid)
+                return fail('OpponentDisconnected', 410)
+            r.hset(player_key(pid), mapping={'last_seen': str(time.time())})
+            r.expire(player_key(pid), JOIN_TTL)
+            return paired(st['opponent'])
+        # A lingering matchmaking poll after game init must not restart it.
+        return fail('AlreadyInGame', 409)
 
 
 @matchmaking.route('/joinMatch', methods=['POST'])
@@ -178,17 +280,21 @@ def join_match():
     other = str(body.get('gi', ''))
     st = state(pid)
     if st:
-        if (st.get('status') != 'matched' or st.get('content') != g.pvzh_content_digest or
+        if (st.get('status') not in ('matched', 'playing') or
+                st.get('content') != g.pvzh_content_digest or
                 st.get('opponent') != other):
             return fail('Invalid match participant / CardDataMismatch', 403)
         second = state(other)
-        if second.get('content') != g.pvzh_content_digest or second.get('opponent') != pid:
-            return fail('OpponentCardDataMismatch', 409)
+        if (second.get('content') != g.pvzh_content_digest or
+                second.get('opponent') != pid or
+                not st.get('session') or st.get('session') != second.get('session')):
+            return fail('OpponentDisconnected', 410)
         sd = r.get(other + '-sd')
         if sd is None:
             return fail('Opponent selection data expired', 410)
+        r.expire(player_key(pid), GAME_IDLE_TTL if st['status'] == 'playing' else JOIN_TTL)
         return {'ty': 'MatchReady', 'sd': txt(sd), 'gi': other, 'or': 50}
-    # Preserve the base server's existing friend challenge behavior.
+    # Base server friend challenge support.
     sd = it_should_be_there_soon(other + '-sd')
     if not sd:
         return fail('No challenge data', 404)
@@ -198,16 +304,15 @@ def join_match():
 @matchmaking.route('/cancelMatch', methods=['POST'])
 def cancel_match():
     pid = get_id()
-    with r.lock('contentmatch:queue-lock', timeout=5, blocking_timeout=2):
+    with r.lock(LOCK_NAME, timeout=5, blocking_timeout=2):
         st = state(pid)
         if st and st.get('content') == g.pvzh_content_digest:
-            cleanup_waiting(pid, st)
+            cleanup_session(pid)  # both sides of a reciprocal match, not just us
     return {}
 
 
 @matchmaking.route('/queryStats', methods=['GET', 'POST'])
 def query_stats():
-    # No queue access; returns neutral faction recommendations until expanded.
     return {'fastestCasualMatch': 0, 'fastestRankedMatch': 0}
 
 
@@ -218,8 +323,11 @@ def create_challenge():
         pid, _, sd = selection(data)
         require_persona(pid)
         other = str(data['o'])
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
-        return fail(str(e))
-    r.setex(pid + '-sd', MATCH_TTL, sd)
-    r.setex(pid + '-seed', MATCH_TTL, str(secrets.randbits(60)))
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return fail(str(exc))
+    with r.lock(LOCK_NAME, timeout=5, blocking_timeout=2):
+        if state(pid):
+            cleanup_session(pid)
+        r.setex(pid + '-sd', MATCH_TTL, sd)
+        r.setex(pid + '-seed', MATCH_TTL, str(secrets.randbits(60)))
     return {'ty': 'JoinMatch', 'eta': 0, 'gi': other}
