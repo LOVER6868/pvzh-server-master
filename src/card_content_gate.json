@@ -1,0 +1,6 @@
+{
+  "algorithm": "unityfs-uncompressed-stream-sha256-v1",
+  "allowed_digests": [
+    "6b75b057fc8b92df533ba610ac4a0e1337f93cc44ced96f6cba33aecc8903ce6"
+  ]
+}
